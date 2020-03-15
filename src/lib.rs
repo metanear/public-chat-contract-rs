@@ -1,6 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use near_bindgen::collections::{Set, Vector};
-use near_bindgen::{env, ext_contract, near_bindgen};
+use near_bindgen::collections::{Vector, Map};
+use near_bindgen::{env, near_bindgen};
 use serde::{Deserialize, Serialize};
 
 #[global_allocator]
@@ -9,25 +9,71 @@ static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 type AppId = String;
 type Key = String;
 type Value = String;
-type Message = String;
 type AccountId = String;
+type ChannelId = String;
+type ChannelHash = Vec<u8>;
 
-const GAS: u64 = 100_000_000_000_000;
+const CHAT_APP_ID: &[u8] = b"chat";
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize)]
-pub struct ChatBot {
-    previous_messages: Vector<Message>,
-    senders: Set<AccountId>,
-    random_seed: Vec<u8>,
+pub struct MetanearChat {
+    channels: Map<ChannelHash, Channel>,
+    total_num_messages: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct UnencryptedMessage {
-    #[serde(rename = "type")]
-    ftype: String,
-    subject: String,
-    content: String,
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Channel {
+    channel_id: ChannelId,
+    messages: Vector<Message>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize)]
+pub struct Message {
+    /// Time in nanoseconds.
+    time: u64,
+    /// The account Id of the message sender.
+    sender_id: AccountId,
+    /// The content of the message.
+    text: String,
+}
+
+#[derive(Deserialize)]
+pub enum GetRequest {
+    Status {},
+    ChannelStatus {
+        channel_id: ChannelId
+    },
+    ChannelMessages {
+        channel_id: ChannelId,
+        from_index: u64,
+        limit: u64,
+    }
+}
+
+#[derive(Serialize)]
+pub struct StatusResponse {
+    num_channels: u64,
+    total_num_messages: u64,
+}
+
+#[derive(Serialize)]
+pub struct ChannelStatusResponse {
+    num_messages: u64,
+}
+
+#[derive(Serialize)]
+pub struct ChannelMessagesResponse {
+    messages: Vec<Message>,
+}
+
+
+#[derive(Deserialize)]
+pub enum IncomingMessage {
+    ChatMessage {
+        channel_id: ChannelId,
+        text: String,
+    }
 }
 
 fn verify_app_id(app_id: &AppId) {
@@ -46,20 +92,41 @@ fn verify_app_id(app_id: &AppId) {
     }
 }
 
+fn verify_channel_id(channel_id: &ChannelId) {
+    if channel_id.len() < 1 || channel_id.len() > 128 {
+        env::panic(b"Channel length should be between 1 and 128 characters");
+    }
+    for c in channel_id.bytes() {
+        match c {
+            b'a'..=b'z' => (),
+            b'0'..=b'9' => (),
+            b'-' | b'_' | b'.' => (),
+            _ => env::panic(
+                b"Unsupported character in the channel. Only allowed to use `-.|` and 0-9 a-z",
+            ),
+        }
+    }
+}
+
 fn app_key(app_id: &AppId, key: &Key) -> Vec<u8> {
-    let mut res = Vec::with_capacity(app_id.len() + key.len() + 1);
-    res.extend_from_slice(app_id.as_bytes());
-    res.push(b':');
-    res.extend_from_slice(key.as_bytes());
+    let app_id_hash = env::sha256(app_id.as_bytes());
+    let key_hash = env::sha256(key.as_bytes());
+    let mut res = Vec::with_capacity(app_id_hash.len() + key_hash.len() + 1);
+    res.push(b'a');
+    res.extend(app_id_hash);
+    res.extend(key_hash);
     res
 }
 
-#[ext_contract(remote)]
-pub trait RemoteSelf {
-    fn post_message(&mut self, app_id: String, message: String);
+
+fn messages_key_from_hash(channel_hash: ChannelHash) -> Vec<u8> {
+    let mut res = Vec::with_capacity(channel_hash.len() + 1);
+    res.push(b'm');
+    res.extend_from_slice(&channel_hash);
+    res
 }
 
-impl Default for ChatBot {
+impl Default for MetanearChat {
     fn default() -> Self {
         env::panic(b"Not initialized yet.");
     }
@@ -70,14 +137,13 @@ fn assert_self() {
 }
 
 #[near_bindgen]
-impl ChatBot {
+impl MetanearChat {
     #[init]
     pub fn new() -> Self {
-        assert!(env::state_read::<ChatBot>().is_none(), "The contract is already initialized");
+        assert!(env::state_read::<MetanearChat>().is_none(), "The contract is already initialized");
         Self {
-            previous_messages: Vector::new(b":pm:".to_vec()),
-            senders: Set::new(b":s:".to_vec()),
-            random_seed: env::random_seed(),
+            channels: Map::new(b"c".to_vec()),
+            total_num_messages: 0,
         }
     }
 
@@ -93,94 +159,126 @@ impl ChatBot {
 
     pub fn get(&self, app_id: AppId, key: Key) -> Option<Value> {
         verify_app_id(&app_id);
-        env::storage_read(&app_key(&app_id, &key)).map(|bytes| String::from_utf8(bytes).unwrap())
-    }
-
-    pub fn post_message(&mut self, app_id: AppId, message: Message) {
-        verify_app_id(&app_id);
-        assert_eq!(app_id.as_bytes(), b"mail", "I only support mail messages");
-
-        let sender_id = env::predecessor_account_id();
-        self.add_sender(&sender_id);
-
-        let message: UnencryptedMessage = match serde_json::from_str(&message) {
-            Ok(res) => res,
-            Err(e) => {
-                self.mail_message(
-                    &sender_id,
-                    "An error has occurred :(".to_string(),
-                    format!("Sorry, something is off. Can't parse it:\n{}", e),
-                );
-                return;
+        if app_id.as_bytes() == CHAT_APP_ID {
+            let request: GetRequest = serde_json::from_str(&key).expect("Can't parse key request");
+            match request {
+                GetRequest::Status {} => {
+                    Some(serde_json::to_string(&StatusResponse {
+                        num_channels: self.channels.len(),
+                        total_num_messages: self.total_num_messages,
+                    }).unwrap())
+                },
+                GetRequest::ChannelStatus { channel_id } => {
+                    let channel = self.get_channel(channel_id);
+                    Some(serde_json::to_string(&ChannelStatusResponse {
+                        num_messages: channel.messages.len(),
+                    }).unwrap())
+                },
+                GetRequest::ChannelMessages { channel_id, from_index, limit } => {
+                    let channel = self.get_channel(channel_id);
+                    let mut messages = Vec::new();
+                    let mut index = from_index;
+                    while (messages.len() as u64) < limit && index < channel.messages.len() {
+                        messages.push(channel.messages.get(index).unwrap());
+                        index += 1;
+                    }
+                    Some(serde_json::to_string(&ChannelMessagesResponse {
+                        messages,
+                    }).unwrap())
+                },
             }
-        };
-        let message = if !message.content.is_empty() {
-            message.content.lines().next().unwrap().to_string()
         } else {
-            message.subject
-        };
-        self.add_message(&message);
-        self.mail_random_message(&sender_id, Some(message));
-        let random_sender_id = self.random_sender_id();
-        if sender_id != random_sender_id {
-            self.mail_random_message(&random_sender_id, None);
+            env::storage_read(&app_key(&app_id, &key)).map(|bytes| String::from_utf8(bytes).unwrap())
         }
     }
 
-    pub fn show_me_senders(&self) -> Vec<AccountId> {
-        self.senders.to_vec()
-    }
+    /// Called when receiving a message
+    pub fn post_message(&mut self, app_id: AppId, message: String) {
+        verify_app_id(&app_id);
+        assert_eq!(app_id.as_bytes(), CHAT_APP_ID, "I only support chat messages");
 
-    pub fn num_messages(&self) -> u64 {
-        self.previous_messages.len()
+        let sender_id = env::predecessor_account_id();
+
+        let incoming_message: IncomingMessage = serde_json::from_str(&message).expect("Can't parse the message");
+        match incoming_message {
+            IncomingMessage::ChatMessage { channel_id, text } => {
+                let mut channel = self.get_channel(channel_id);
+                channel.add_message(sender_id, text);
+                self.save_channel(&channel);
+                self.total_num_messages += 1;
+            },
+        };
     }
 }
 
-impl ChatBot {
-    fn add_sender(&mut self, sender_id: &AccountId) {
-        self.senders.insert(&sender_id);
+impl MetanearChat {
+    pub fn get_channel(&self, channel_id: ChannelId) -> Channel {
+        verify_channel_id(&channel_id);
+        let channel_hash = env::sha256(channel_id.as_bytes());
+        self.channels.get(&channel_hash).unwrap_or_else(|| Channel::new(channel_id))
     }
 
-    fn add_message(&mut self, message: &Message) {
-        self.previous_messages.push(&message);
+    pub fn save_channel(&mut self, channel: &Channel) {
+        let channel_hash = env::sha256(channel.channel_id.as_bytes());
+        self.channels.insert(&channel_hash, &channel);
     }
+}
 
-    fn random_u64(&mut self) -> u64 {
-        self.random_seed = env::sha256(&self.random_seed);
-        let mut v = [0u8; 8];
-        v.copy_from_slice(&self.random_seed[..8]);
-        u64::from_le_bytes(v)
-    }
 
-    fn random_sender_id(&mut self) -> AccountId {
-        let rnd = self.random_u64();
-        let v = self.senders.as_vector();
-        v.get(rnd % v.len()).unwrap()
-    }
-
-    fn random_message(&mut self) -> Message {
-        let rnd = self.random_u64();
-        let v = &self.previous_messages;
-        v.get(rnd % v.len()).unwrap()
-    }
-
-    fn mail_random_message(&mut self, receiver_id: &AccountId, subject: Option<Message>) {
-        let message = self.random_message();
-        if let Some(subject) = subject {
-            self.mail_message(&receiver_id, format!("Re: {}", subject), message);
-        } else {
-            let content = self.random_message();
-            self.mail_message(&receiver_id, message, content);
+impl Channel {
+    pub fn new(channel_id: ChannelId) -> Self {
+        Self {
+            messages: Vector::new(messages_key_from_hash(env::sha256(channel_id.as_bytes()))),
+            channel_id,
         }
     }
 
-    fn mail_message(&self, receiver_id: &AccountId, subject: String, content: Message) {
-        let message = serde_json::to_string(&UnencryptedMessage {
-            ftype: "mail".to_string(),
-            subject,
-            content,
-        })
-        .unwrap();
-        remote::post_message("mail".to_string(), message, &receiver_id, 0, GAS);
+    pub fn add_message(&mut self, sender_id: AccountId, text: String) {
+        self.messages.push(&Message {
+            sender_id,
+            text,
+            time: env::block_timestamp(),
+        });
+    }
+}
+
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_bindgen::MockedBlockchain;
+    use near_bindgen::{testing_env, VMContext};
+
+    fn alice() -> String {
+        "alice.near".to_string()
+    }
+
+    fn bob() -> String {
+        "bob.near".to_string()
+    }
+
+    fn carol() -> String {
+        "carol.near".to_string()
+    }
+
+    fn get_context(signer_account_pk: Vec<u8>) -> VMContext {
+        VMContext {
+            current_account_id: alice(),
+            signer_account_id: alice(),
+            signer_account_pk,
+            predecessor_account_id: alice(),
+            input: vec![],
+            block_index: 0,
+            block_timestamp: 0,
+            account_balance: 0,
+            account_locked_balance: 0,
+            storage_usage: 10u64.pow(6),
+            attached_deposit: 0,
+            prepaid_gas: 10u64.pow(18),
+            random_seed: vec![0, 1, 2],
+            is_view: false,
+            output_data_receivers: vec![],
+        }
     }
 }

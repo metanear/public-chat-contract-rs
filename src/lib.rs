@@ -1,6 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use near_bindgen::collections::{Vector, Map};
-use near_bindgen::{env, near_bindgen};
+use near_sdk::collections::{Vector, Map};
+use near_sdk::{env, near_bindgen};
 use serde::{Deserialize, Serialize};
 
 #[global_allocator]

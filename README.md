@@ -1,6 +1,11 @@
-# Meta NEAR chat
+# Public Chat contract for Meta NEAR
 
-Smart contract to aggregate chat messages in a chat app for Meta NEAR. Try it out at [metanear.com](https://metanear.com)
+Contract to aggregate chat messages in a `chat` app for Meta NEAR.
+It implements messaging protocol with extendable APIs using Rust enums.
+The contract is deployed on `metanear-chat` account on NEAR Testnet.
+
+
+Try it out at [metanear.com](https://metanear.com)
 
 ## Building
 
@@ -10,8 +15,6 @@ Smart contract to aggregate chat messages in a chat app for Meta NEAR. Try it ou
 
 ## Testing
 
-To test run:
-
 ```bash
-cargo test --package metanear-chat -- --nocapture
+cargo test --package metanear-public-chat -- --nocapture
 ```

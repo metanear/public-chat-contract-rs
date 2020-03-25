@@ -237,7 +237,7 @@ impl Channel {
         self.messages.push(&Message {
             sender_id,
             text,
-            time: env::block_timestamp(),
+            time: env::block_timestamp() / 1000000,
         });
     }
 }
